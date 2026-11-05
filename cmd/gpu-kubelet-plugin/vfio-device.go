@@ -50,7 +50,9 @@ const (
 	// NV_MAJOR_DEVICE_NUMBER: /dev/nvidia<minor> is always char device 195:<minor>.
 	nvidiaDeviceMajor    = 195
 	gpuFreeCheckInterval = 1 * time.Second
-	gpuFreeCheckTimeout  = 60 * time.Second
+	// Shorter than the kubelet's deadline for NodePrepareResources (45s), so a
+	// GPU that stays busy fails with the holders named instead of a timeout.
+	gpuFreeCheckTimeout = 30 * time.Second
 	// Keep driverChangeTimeout short to avoid blocking the plugin process
 	// for too long from serving other device preparation/unpreparation
 	// requests.
@@ -65,6 +67,12 @@ type VfioPciManager struct {
 	nvidiaEnabled       bool
 
 	inflightDriverSwitches map[string]struct{}
+
+	// Indirections over host and NVML operations, so the evacuation sequence
+	// can be tested without a GPU.
+	disablePersistence func(pciAddress string) error
+	setDrain           func(pciAddress string, draining bool) error
+	waitForFree        func(ctx context.Context, info *VfioDeviceInfo) error
 }
 
 func NewVfioPciManager(containerDriverRoot string, hostDriverRoot string, nvlib *deviceLib, nvidiaEnabled bool) (*VfioPciManager, error) {
@@ -83,6 +91,9 @@ func NewVfioPciManager(containerDriverRoot string, hostDriverRoot string, nvlib 
 		nvidiaEnabled:          nvidiaEnabled,
 		inflightDriverSwitches: make(map[string]struct{}),
 	}
+	vm.disablePersistence = vm.disableGPUPersistenceMode
+	vm.setDrain = nvlib.setGPUDrainState
+	vm.waitForFree = vm.WaitForGPUFree
 
 	return vm, nil
 }
@@ -135,17 +146,11 @@ func (vm *VfioPciManager) Configure(ctx context.Context, info *VfioDeviceInfo) e
 		return fmt.Errorf("error verifying disabled VFs: %w", err)
 	}
 
+	drained := false
 	if driver == nvidiaDriver {
-		// Disable GPU Persistence Mode.
-		err = vm.disableGPUPersistenceMode(info.PciBusID)
+		drained, err = vm.evacuateGPU(ctx, info)
 		if err != nil {
-			return fmt.Errorf("error disabling persistence mode for GPU %q: %w", info.PciBusID, err)
-		}
-
-		// Wait for other GPU clients to evacuate.
-		err = vm.WaitForGPUFree(ctx, info)
-		if err != nil {
-			return fmt.Errorf("error waiting for GPU %q to be free: %w", info.PciBusID, err)
+			return err
 		}
 	}
 
@@ -159,10 +164,78 @@ func (vm *VfioPciManager) Configure(ctx context.Context, info *VfioDeviceInfo) e
 		return vm.changeDriver(info.PciBusID, vfioDriver)
 	})
 	if err != nil {
+		// A timed-out change may still be running in the kernel; any further
+		// NVML call on the GPU would block behind it, so leave it drained.
+		if drained && !errors.Is(err, context.DeadlineExceeded) {
+			vm.undrain(info.PciBusID)
+		}
 		return fmt.Errorf("error changing driver for GPU %q: %w", info.PciBusID, err)
 	}
 
 	return nil
+}
+
+// evacuateGPU makes sure nothing holds the GPU before it is unbound from the
+// nvidia driver. The unbind cannot be interrupted: if anything still holds
+// the GPU, the kernel waits for it forever ("Attempting to remove device ...
+// with non-zero usage count!") and only a reboot recovers the node. It
+// reports whether the GPU was left draining.
+func (vm *VfioPciManager) evacuateGPU(ctx context.Context, info *VfioDeviceInfo) (bool, error) {
+	held, err := fbdevHoldsGPU(sysModulePath, pciDevicesPath, info.PciBusID)
+	if err != nil {
+		return false, fmt.Errorf("error checking for a framebuffer console on GPU %q: %w", info.PciBusID, err)
+	}
+	// The console holds the GPU from inside the kernel, where neither the
+	// holder scan nor draining can see or release it.
+	if held {
+		return false, fmt.Errorf("GPU %q backs an nvidia_drm framebuffer console, which holds it inside the kernel; load nvidia_drm with fbdev=0 on nodes that pass GPUs through", info.PciBusID)
+	}
+
+	if err := vm.disablePersistence(info.PciBusID); err != nil {
+		return false, fmt.Errorf("error disabling persistence mode for GPU %q: %w", info.PciBusID, err)
+	}
+
+	// Drain first, so that no client can attach between the holder scan and
+	// the unbind. Monitoring agents attach for a moment every few seconds.
+	drained := true
+	if err := vm.setDrain(info.PciBusID, true); err != nil {
+		drained = false
+		klog.Warningf("Could not drain GPU %q, relying on the holder scan alone: %v", info.PciBusID, err)
+	}
+
+	if err := vm.waitForFree(ctx, info); err != nil {
+		if drained {
+			vm.undrain(info.PciBusID)
+		}
+		return false, fmt.Errorf("error waiting for GPU %q to be free: %w", info.PciBusID, err)
+	}
+	return drained, nil
+}
+
+func (vm *VfioPciManager) undrain(pciAddress string) {
+	if err := vm.setDrain(pciAddress, false); err != nil {
+		klog.Warningf("Could not undrain GPU %q; new clients cannot use it until it is undrained: %v", pciAddress, err)
+	}
+}
+
+// fbdevHoldsGPU reports whether nvidia_drm's framebuffer console is enabled
+// and backed by the GPU.
+func fbdevHoldsGPU(sysModuleRoot, pciDevicesRoot, pciAddress string) (bool, error) {
+	param, err := os.ReadFile(filepath.Join(sysModuleRoot, "nvidia_drm", "parameters", "fbdev"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(string(param)) != "Y" {
+		return false, nil
+	}
+	fbs, err := filepath.Glob(filepath.Join(pciDevicesRoot, pciAddress, "graphics", "fb*"))
+	if err != nil {
+		return false, err
+	}
+	return len(fbs) > 0, nil
 }
 
 // WaitForGPUFree does a best effort scan of the GPU clients running on the host and
@@ -174,6 +247,10 @@ func (vm *VfioPciManager) Configure(ctx context.Context, info *VfioDeviceInfo) e
 // while it is busy. Matching by device number rather than path also detects
 // containerized GPU clients that work with their own view of the device nodes.
 func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceInfo) error {
+	return vm.waitForDeviceFree(ctx, info, nvidiaDeviceMajor)
+}
+
+func (vm *VfioPciManager) waitForDeviceFree(ctx context.Context, info *VfioDeviceInfo, major uint32) error {
 	if info.parent == nil {
 		return nil
 	}
@@ -184,10 +261,14 @@ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceIn
 	var err error
 	for {
 		select {
+		// The kubelet retries a cancelled prepare; waiting on would hold the
+		// prepare lock and fail that retry too.
+		case <-ctx.Done():
+			return fmt.Errorf("gave up waiting for gpu to be free: %w", errors.Join(ctx.Err(), err))
 		case <-timeout:
 			return fmt.Errorf("timed out waiting for gpu to be free: %w", err)
 		case <-ticker.C:
-			holders, scanErr := findCharDeviceHolders(procRoot, nvidiaDeviceMajor, uint32(info.parent.minor)) //nolint:gosec
+			holders, scanErr := findCharDeviceHolders(procRoot, major, uint32(info.parent.minor)) //nolint:gosec
 			if scanErr != nil {
 				err = fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, scanErr)
 				klog.V(6).Infof("%v", err)
@@ -269,6 +350,10 @@ func (vm *VfioPciManager) Unconfigure(ctx context.Context, info *VfioDeviceInfo)
 	if err != nil {
 		return fmt.Errorf("error changing driver for GPU %q: %w", info.PciBusID, err)
 	}
+
+	// Configure leaves the GPU draining; clear it in case the driver keeps the
+	// state across a rebind, or new clients would never see the GPU.
+	vm.undrain(info.PciBusID)
 
 	// Enable GPU Persistence Mode.
 	err = vm.enableGPUPersistenceMode(info.PciBusID)

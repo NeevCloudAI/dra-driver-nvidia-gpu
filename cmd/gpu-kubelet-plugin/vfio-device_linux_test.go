@@ -86,3 +86,20 @@ func TestWaitForGPUFree(t *testing.T) {
 	defer cancel()
 	require.NoError(t, vm.WaitForGPUFree(ctx, info))
 }
+
+func TestWaitForGPUFreeStopsWhenCancelled(t *testing.T) {
+	f, err := os.Open("/dev/null")
+	require.NoError(t, err)
+	defer f.Close()
+
+	// /dev/null (1:3) stays held by this process for the whole test.
+	vm := &VfioPciManager{}
+	info := &VfioDeviceInfo{PciBusID: "0000:01:00.0", parent: &GpuInfo{minor: 3}}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err = vm.waitForDeviceFree(ctx, info, 1)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(start), gpuFreeCheckTimeout)
+}
