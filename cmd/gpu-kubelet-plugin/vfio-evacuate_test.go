@@ -73,7 +73,7 @@ type evacuation struct {
 	calls []string
 }
 
-func (e *evacuation) manager(persistErr, drainErr, waitErr error) *VfioPciManager {
+func (e *evacuation) manager(persistErr, drainErr, waitErr error, holders []string, scanErr error) *VfioPciManager {
 	return &VfioPciManager{
 		disablePersistence: func(string) error {
 			e.calls = append(e.calls, "persistence-off")
@@ -91,37 +91,52 @@ func (e *evacuation) manager(persistErr, drainErr, waitErr error) *VfioPciManage
 			e.calls = append(e.calls, "wait-free")
 			return waitErr
 		},
+		findHolders: func(*VfioDeviceInfo) ([]string, error) {
+			e.calls = append(e.calls, "rescan")
+			return holders, scanErr
+		},
 	}
 }
 
 func TestEvacuateGPU(t *testing.T) {
 	boom := errors.New("boom")
 	tests := map[string]struct {
-		persistErr, drainErr, waitErr error
-		wantCalls                     []string
-		wantDrained                   bool
-		wantErr                       bool
+		persistErr, drainErr, waitErr, scanErr error
+		holders                                []string
+		wantCalls                              []string
+		wantDrained                            bool
+		wantErr                                bool
 	}{
-		"drains before checking for holders": {
-			wantCalls:   []string{"persistence-off", "drain", "wait-free"},
+		"free: waits, then drains and rescans": {
+			wantCalls:   []string{"persistence-off", "wait-free", "drain", "rescan"},
 			wantDrained: true,
 		},
-		"still held: undrains and refuses": {
+		"still held: refuses without ever draining": {
 			waitErr:   boom,
-			wantCalls: []string{"persistence-off", "drain", "wait-free", "undrain"},
+			wantCalls: []string{"persistence-off", "wait-free"},
 			wantErr:   true,
 		},
-		"drain unsupported: falls back to the holder scan": {
-			drainErr:  boom,
-			wantCalls: []string{"persistence-off", "drain", "wait-free"},
-		},
-		"drain unsupported and held: nothing to undrain": {
-			drainErr:  boom,
-			waitErr:   boom,
-			wantCalls: []string{"persistence-off", "drain", "wait-free"},
+		"claimed between the wait and the drain: undrains and refuses": {
+			holders:   []string{"4242(nv-hostengine)"},
+			wantCalls: []string{"persistence-off", "wait-free", "drain", "rescan", "undrain"},
 			wantErr:   true,
 		},
-		"persistence mode stuck on: stops before draining": {
+		"rescan fails: undrains and refuses": {
+			scanErr:   boom,
+			wantCalls: []string{"persistence-off", "wait-free", "drain", "rescan", "undrain"},
+			wantErr:   true,
+		},
+		"drain unsupported: falls back to the holder scans": {
+			drainErr:  boom,
+			wantCalls: []string{"persistence-off", "wait-free", "drain", "rescan"},
+		},
+		"drain unsupported and claimed again: nothing to undrain": {
+			drainErr:  boom,
+			holders:   []string{"4242(nv-hostengine)"},
+			wantCalls: []string{"persistence-off", "wait-free", "drain", "rescan"},
+			wantErr:   true,
+		},
+		"persistence mode stuck on: stops before waiting": {
 			persistErr: boom,
 			wantCalls:  []string{"persistence-off"},
 			wantErr:    true,
@@ -130,7 +145,8 @@ func TestEvacuateGPU(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			e := &evacuation{}
-			drained, err := e.manager(tc.persistErr, tc.drainErr, tc.waitErr).evacuateGPU(context.Background(), &VfioDeviceInfo{PciBusID: testPCIAddress})
+			vm := e.manager(tc.persistErr, tc.drainErr, tc.waitErr, tc.holders, tc.scanErr)
+			drained, err := vm.evacuateGPU(context.Background(), &VfioDeviceInfo{PciBusID: testPCIAddress})
 			if tc.wantErr {
 				require.Error(t, err)
 			} else {
@@ -140,6 +156,19 @@ func TestEvacuateGPU(t *testing.T) {
 			require.Equal(t, tc.wantCalls, e.calls)
 		})
 	}
+}
+
+func TestEvacuateGPUNamesLateHolders(t *testing.T) {
+	e := &evacuation{}
+	vm := e.manager(nil, nil, nil, []string{"4242(nv-hostengine)"}, nil)
+	_, err := vm.evacuateGPU(context.Background(), &VfioDeviceInfo{PciBusID: testPCIAddress})
+	require.ErrorContains(t, err, "4242(nv-hostengine)")
+}
+
+func TestGPUHoldersWithoutParent(t *testing.T) {
+	holders, err := gpuHolders(&VfioDeviceInfo{PciBusID: testPCIAddress})
+	require.NoError(t, err)
+	require.Empty(t, holders)
 }
 
 func TestUndrainFailureIsOnlyLogged(t *testing.T) {

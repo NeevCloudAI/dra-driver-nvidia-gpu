@@ -107,7 +107,10 @@ and an in-flight marker. Three gaps remain.
 
 NVML can drain a GPU: `nvidia-smi drain -p <bdf> -m 1`. A draining GPU refuses
 new clients ("No devices were found", exit 6) while clients already attached
-keep running. That closes gap 2: drain first, then check, then unbind.
+keep running. That closes gap 2, but only if the drain comes after the card is
+known to be free: a drained card that is still in use refuses its pod's new
+processes, container restarts and monitoring polls. So: wait until free, drain,
+scan once more, unbind. A busy card is refused without ever being drained.
 
 ### Configure (nvidia → vfio-pci)
 
@@ -120,13 +123,15 @@ keep running. That closes gap 2: drain first, then check, then unbind.
    │    ├─ nvidia_drm fbdev=Y and the card backs a framebuffer?
    │    │      └─ yes ─► refuse: "load nvidia_drm with fbdev=0"     (kernel holder, nothing can release it)
    │    ├─ persistence mode off
+   │    ├─ wait for no holders (scan /proc for 195:<minor>, every 1s), card NOT drained
+   │    │      ├─ ctx cancelled (kubelet gave up)  ─► refuse
+   │    │      └─ 30s, still held ─► refuse:
+   │    │           "has open fds by process(es): <pid>(<exe>)"
    │    ├─ DRAIN   nvidia-smi drain -p <bdf> -m 1
    │    │      └─ unsupported ─► log, continue with the scan alone
-   │    └─ wait for no holders (scan /proc for 195:<minor>, every 1s)
-   │           ├─ free ─────────────────────────────────────────────┐
-   │           ├─ ctx cancelled (kubelet gave up)  ─► UNDRAIN, refuse │
-   │           └─ 30s, still held ─► UNDRAIN, refuse:                 │
-   │                "has open fds by process(es): <pid>(<exe>)"       │
+   │    └─ scan once more (catches a client that attached before the drain)
+   │           ├─ held ─► UNDRAIN, refuse: "claimed again before it could be unbound"
+   │           └─ free ─────────────────────────────────────────────┐
    │                                                                  ▼
    ├─ change driver in a goroutine, 15s timeout (unchanged upstream logic)
    │      ├─ ok ─────────────────────────────────────────────────► done (card stays drained; it is off nvidia)
@@ -149,7 +154,8 @@ The undrain in `Unconfigure` is defensive: the card was drained when it left
 | Situation | Result |
 | --- | --- |
 | Card free | Moves to `vfio-pci` in about 2s (persistence off, drain, scan, unbind, bind) |
-| Card held by any process, in any container | Refused within 30s with the holders named; card undrained and left on `nvidia`; the kubelet retries |
+| Card held by any process, in any container | Refused within 30s with the holders named; card never drained, so the holder's new processes and restarts keep working; left on `nvidia`; the kubelet retries |
+| Client attaches between the wait and the drain | Caught by the rescan; card undrained and refused; the kubelet retries |
 | Holder exits during the retries | A later retry succeeds |
 | Kubelet cancels the call | Wait returns at once, card undrained, prepare lock released |
 | Drain unsupported on the GPU or driver | Logged; behaves like upstream plus #1504 |
@@ -173,13 +179,13 @@ The undrain in `Unconfigure` is defensive: the card was drained when it left
 | Where | What |
 | --- | --- |
 | `cmd/gpu-kubelet-plugin/vfio-device.go` `Configure` | calls `evacuateGPU` for a card on `nvidia`; undrains on a failed (not timed-out) driver change |
-| `vfio-device.go` `evacuateGPU` | fbdev guard, persistence off, drain, wait for holders, undrain on refusal |
+| `vfio-device.go` `evacuateGPU` | fbdev guard, persistence off, wait for holders (undrained), drain, rescan, undrain on refusal |
 | `vfio-device.go` `fbdevHoldsGPU` | `/sys/module/nvidia_drm/parameters/fbdev` is `Y` and `/sys/bus/pci/devices/<bdf>/graphics/fb*` exists |
 | `vfio-device.go` `WaitForGPUFree` / `waitForDeviceFree` | 30s cap, returns on `ctx.Done()` |
 | `vfio-device.go` `findCharDeviceHolders` | #1504: fd scan of `/proc` matching `st_rdev` |
 | `vfio-device.go` `Unconfigure` | undrain after the card is back on `nvidia` |
 | `cmd/gpu-kubelet-plugin/nvlib.go` `setGPUDrainState` | `chroot <driver-root> nvidia-smi drain -p <bdf> -m 0/1` |
-| `VfioPciManager.{disablePersistence,setDrain,waitForFree}` | indirections so the sequence is unit-tested without a GPU |
+| `VfioPciManager.{disablePersistence,setDrain,waitForFree,findHolders}` | indirections so the sequence is unit-tested without a GPU |
 
 ## Verification
 
@@ -188,7 +194,7 @@ Unit tests (Linux; the scan reads `/proc`):
 ```
 docker run --rm -v "$PWD":/src -w /src -e GOFLAGS=-mod=vendor \
   -e CGO_CFLAGS=-Wno-deprecated-declarations golang:1.26 \
-  go test ./cmd/gpu-kubelet-plugin/ -run 'WaitForGPUFree|Evacuate|Fbdev|FindCharDevice|Undrain' -v
+  go test ./cmd/gpu-kubelet-plugin/ -run 'WaitForGPUFree|Evacuate|Fbdev|FindCharDevice|Undrain|GPUHolders' -v
 ```
 
 ```
@@ -216,7 +222,9 @@ $ nvidia-smi drain -p 0000:01:00.0 -m 0
 Successfully set GPU 00000000:01:00.0 drain state to: not draining.
 ```
 
-**Busy card is refused, not hung.** Same holder, then a pod with a
+**Busy card is refused, not hung.** Recorded on the previous revision, which
+drained before waiting; the current one refuses the same way but skips the
+drain/undrain pair in the log. Same holder, then a pod with a
 `vfio.gpu.nvidia.com` claim. Plugin log:
 
 ```

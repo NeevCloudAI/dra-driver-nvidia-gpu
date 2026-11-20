@@ -73,6 +73,7 @@ type VfioPciManager struct {
 	disablePersistence func(pciAddress string) error
 	setDrain           func(pciAddress string, draining bool) error
 	waitForFree        func(ctx context.Context, info *VfioDeviceInfo) error
+	findHolders        func(info *VfioDeviceInfo) ([]string, error)
 }
 
 func NewVfioPciManager(containerDriverRoot string, hostDriverRoot string, nvlib *deviceLib, nvidiaEnabled bool) (*VfioPciManager, error) {
@@ -94,6 +95,7 @@ func NewVfioPciManager(containerDriverRoot string, hostDriverRoot string, nvlib 
 	vm.disablePersistence = vm.disableGPUPersistenceMode
 	vm.setDrain = nvlib.setGPUDrainState
 	vm.waitForFree = vm.WaitForGPUFree
+	vm.findHolders = gpuHolders
 
 	return vm, nil
 }
@@ -195,19 +197,29 @@ func (vm *VfioPciManager) evacuateGPU(ctx context.Context, info *VfioDeviceInfo)
 		return false, fmt.Errorf("error disabling persistence mode for GPU %q: %w", info.PciBusID, err)
 	}
 
-	// Drain first, so that no client can attach between the holder scan and
-	// the unbind. Monitoring agents attach for a moment every few seconds.
+	// Wait before draining: a drained GPU refuses new clients, so draining a
+	// GPU that is still in use would break its pod's restarts and new processes.
+	if err := vm.waitForFree(ctx, info); err != nil {
+		return false, fmt.Errorf("error waiting for GPU %q to be free: %w", info.PciBusID, err)
+	}
+
+	// Drain, then scan again, so that no client can attach between the scan
+	// and the unbind. Monitoring agents attach for a moment every few seconds.
 	drained := true
 	if err := vm.setDrain(info.PciBusID, true); err != nil {
 		drained = false
 		klog.Warningf("Could not drain GPU %q, relying on the holder scan alone: %v", info.PciBusID, err)
 	}
 
-	if err := vm.waitForFree(ctx, info); err != nil {
+	holders, err := vm.findHolders(info)
+	if err == nil && len(holders) > 0 {
+		err = fmt.Errorf("gpu device %q has open fds by process(es): %s", info.PciBusID, strings.Join(holders, ","))
+	}
+	if err != nil {
 		if drained {
 			vm.undrain(info.PciBusID)
 		}
-		return false, fmt.Errorf("error waiting for GPU %q to be free: %w", info.PciBusID, err)
+		return false, fmt.Errorf("GPU %q was claimed again before it could be unbound: %w", info.PciBusID, err)
 	}
 	return drained, nil
 }
@@ -268,7 +280,7 @@ func (vm *VfioPciManager) waitForDeviceFree(ctx context.Context, info *VfioDevic
 		case <-timeout:
 			return fmt.Errorf("timed out waiting for gpu to be free: %w", err)
 		case <-ticker.C:
-			holders, scanErr := findCharDeviceHolders(procRoot, major, uint32(info.parent.minor)) //nolint:gosec
+			holders, scanErr := charDeviceHolders(info, major)
 			if scanErr != nil {
 				err = fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, scanErr)
 				klog.V(6).Infof("%v", err)
@@ -281,6 +293,17 @@ func (vm *VfioPciManager) waitForDeviceFree(ctx context.Context, info *VfioDevic
 			klog.V(6).Infof("%v", err)
 		}
 	}
+}
+
+func gpuHolders(info *VfioDeviceInfo) ([]string, error) {
+	return charDeviceHolders(info, nvidiaDeviceMajor)
+}
+
+func charDeviceHolders(info *VfioDeviceInfo, major uint32) ([]string, error) {
+	if info.parent == nil {
+		return nil, nil
+	}
+	return findCharDeviceHolders(procRoot, major, uint32(info.parent.minor)) //nolint:gosec
 }
 
 // findCharDeviceHolders returns "<pid>(<exe>)" for every process under procRoot
