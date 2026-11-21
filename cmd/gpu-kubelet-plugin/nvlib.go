@@ -1552,6 +1552,22 @@ func (l deviceLib) disableGPUPersistenceMode(pciAddress string) error {
 	return nil
 }
 
+// setGPUDrainState sets the GPU's drain state. A draining GPU accepts no new
+// clients, while those already attached keep running.
+func (l deviceLib) setGPUDrainState(pciAddress string, draining bool) error {
+	mode := "0"
+	if draining {
+		mode = "1"
+	}
+	cmd := exec.Command("chroot", l.devRoot, "nvidia-smi", "drain", "-p", pciAddress, "-m", mode)
+	output, err := cmd.CombinedOutput()
+	klog.V(4).Infof("setGPUDrainState command: %s, output: \n%s", cmd.String(), string(output))
+	if err != nil {
+		return fmt.Errorf("error running nvidia-smi: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
 // Enable GPU Persistence mode
 //
 // While persistence mode disablement can be done using nvidia-smi, we cannot
